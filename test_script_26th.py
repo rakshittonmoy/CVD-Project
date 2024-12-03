@@ -2,19 +2,167 @@ from object_segmentation_28th import object_detection_and_selection
 import torch
 import numpy as np
 from PIL import Image, ImageDraw
+
 import matplotlib.pyplot as plt
+import torchvision
 from torchvision import transforms
-import requests
 from io import BytesIO
 import cv2
 import numpy as np
 import queue
 import os
 import datetime
+import torchvision.transforms.functional as F
+
+
 
 drawing = False  # True if the mouse is pressed. False otherwise
 ix, iy = -1, -1 
 results_queue = queue.Queue()
+
+
+def get_image_dimensions(image_path):
+    """
+    Get the original dimensions of an image
+    
+    Parameters:
+    -----------
+    image_path : str
+        Path to the image file
+    
+    Returns:
+    --------
+    tuple
+        (width, height) of the original image
+    """
+    with Image.open(image_path) as img:
+        return img.size  # Returns (width, height)
+
+def smart_resize(image, max_size=1024):
+    """
+    Resize image intelligently while preserving aspect ratio
+    
+    Parameters:
+    -----------
+    image : torch.Tensor
+        Input image tensor
+    max_size : int, optional
+        Maximum dimension size (default 1024)
+    
+    Returns:
+    --------
+    torch.Tensor
+        Resized image tensor
+    """
+    # Convert tensor to PIL Image for easier manipulation
+    pil_image = torchvision.transforms.ToPILImage()(image.squeeze(0))
+    
+    # Calculate resize dimensions while maintaining aspect ratio
+    width, height = pil_image.size
+    
+    # Determine scaling factor
+    if max(width, height) > max_size:
+        scale = max_size / max(width, height)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        
+        # Use high-quality resampling
+        resized_image = pil_image.resize((new_width, new_height), Image.LANCZOS)
+    else:
+        resized_image = pil_image
+    
+    # Convert back to tensor
+    return torchvision.transforms.ToTensor()(resized_image).unsqueeze(0)
+
+def preprocess_image(image_path, mask_path=None):
+    """
+    Preprocess image and mask with smart resizing
+    
+    Parameters:
+    -----------
+    image_path : str
+        Path to the input image
+    mask_path : str, optional
+        Path to the mask image
+    
+    Returns:
+    --------
+    tuple
+        (processed image tensor, processed mask tensor)
+    """
+    # Get original image dimensions
+    original_dims = get_image_dimensions(image_path)
+    print(f"Original image dimensions: {original_dims}")
+    
+    # Open and convert image
+    image = Image.open(image_path).convert('RGB')
+    image_tensor = torchvision.transforms.ToTensor()(image)
+    
+    # Smart resize
+    resized_image = smart_resize(image_tensor)
+    
+    # Process mask similarly if provided
+    if mask_path:
+        mask = Image.open(mask_path).convert('L')
+        mask_tensor = torchvision.transforms.ToTensor()(mask)
+        resized_mask = smart_resize(mask_tensor)
+    else:
+        # Create a default mask if no mask provided
+        resized_mask = torch.ones_like(resized_image[0:1])
+    
+    return resized_image, resized_mask
+
+def inpaint_image(image, mask, queue_results=None, num_iterations=800, learning_rate=0.01):
+    """
+    Perform inpainting with more flexible resizing
+    
+    Parameters:
+    -----------
+    image : torch.Tensor
+        Input image tensor
+    mask : torch.Tensor
+        Mask tensor
+    queue_results : Queue, optional
+        For tracking intermediate results
+    num_iterations : int, optional
+        Number of training iterations
+    learning_rate : float, optional
+        Optimization learning rate
+    
+    Returns:
+    --------
+    torch.Tensor
+        Inpainted image tensor
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Create model and optimizer
+    net = DeepImagePrior().to(device)
+    optimizer = optim.Adam(net.parameters(), lr=learning_rate)
+    
+    # Create input noise matching image dimensions
+    input_noise = torch.randn(1, 32, image.shape[2], image.shape[3]).to(device)
+    input_noise.requires_grad_(True)
+    
+    # Training loop with optional result tracking
+    for i in range(num_iterations):
+        optimizer.zero_grad()
+        
+        # Generate output
+        out = net(input_noise)
+        
+        # Compute loss only on masked regions
+        loss = torch.mean((out - image) ** 2 * mask)
+        loss.backward()
+        
+        optimizer.step()
+        
+        # Optional result tracking
+        if queue_results and i % 100 == 0:
+            print(f'Iteration {i}/{num_iterations}, Loss: {loss.item():.6f}')
+            queue_results.put((out.clone().detach().cpu(), f'Iteration {i}: Loss={loss.item():.6f}'))
+
+    return out.detach()
 
 def create_test_mask(image_size, object_position, object_size):
     """
@@ -61,11 +209,6 @@ def apply_mask_to_image(image, mask):
     
     return (masked_image * 255).astype(np.uint8)
 
-def download_test_image(url):
-    """Download a test image from URL and convert to RGB mode"""
-    response = requests.get(url)
-    img = Image.open(BytesIO(response.content)).convert('RGB')
-    return img
 
 def visualize_process(original, mask, masked, result):
     """Visualize the original, mask, masked image, and result"""
@@ -101,20 +244,16 @@ def test_inpainting(image_path, mask_path):
     
     image = transforms.ToTensor()(image)
     mask = transforms.ToTensor()(mask)
+
+    image, mask = preprocess_image(image_path, mask_path)
     
     # Run inpainting
     print("Starting inpainting process...")
-    result = inpaint_image(image, mask, results_queue, num_iterations=3000, learning_rate=0.01)
+    result, losses = inpaint_image(image, mask, results_queue, num_iterations=5000, learning_rate=0.1)
     
-    # Visualize results
-    # visualize_process(
-    #     image.squeeze(0).permute(1, 2, 0).numpy(),
-    #     mask.squeeze(0).numpy(),
-    #     apply_mask_to_image(image.squeeze(0).permute(1, 2, 0).numpy(), mask.squeeze(0).numpy()),
-    #     result.squeeze(0).permute(1, 2, 0).numpy()
-    # )
     initial_image = load_initial_image('detected_image.jpg')
     display_results(initial_image)
+    display_loss_graph(losses)
     # Save result as PNG for best quality
     save_result(result, "inpainting_result.png")
     print("Inpainting complete! Result saved as 'inpainting_result.png'")
@@ -130,6 +269,29 @@ def load_initial_image(image_path):
     image_tensor = transform(image).unsqueeze(0)  # Add batch dimension
     return image_tensor
 
+def display_loss_graph(losses):
+    # Plotting the loss graph with annotations
+    plt.figure(figsize=(20, 20))
+    plt.plot(losses, label='Loss per Iteration')
+    plt.title('Loss during Training')
+    plt.xlabel('Iteration')
+    plt.ylabel('Loss')
+
+    # Annotating specific points
+    for i in range(0, len(losses), 200):  # Every 50 iterations
+        plt.annotate(f'{losses[i]:.4f}',  # The loss value formatted to 4 decimals
+                    (i, losses[i]),      # Point to annotate
+                    textcoords="offset points",  # Positioning of the text
+                    xytext=(0,20),       # Distance from the point
+                    ha='center')         # Alignment
+
+    plt.xticks(range(0, len(losses), 200))  # Set x-ticks to show every 50 iterations
+    plt.legend()
+    results_dir = "results"
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"{results_dir}/loss_plot_{timestamp}.png"
+    plt.savefig(filename)
+    plt.show()
 
 def display_results(initial_image):
     # Convert the initial image for plotting
@@ -186,52 +348,27 @@ def ensure_same_size(image, mask):
         mask = mask.resize(image.size)
     return image, mask
 
-# Function to handle mouse events
-def draw_rectangle(event, x, y, flags, param):
-    global ix, iy, drawing, img, mask
-
-    if event == cv2.EVENT_LBUTTONDOWN:
-        drawing = True
-        ix, iy = x, y
-
-    elif event == cv2.EVENT_MOUSEMOVE:
-        if drawing == True:
-            cv2.rectangle(img, (ix, iy), (x, y), (0, 255, 0), -1)
-            cv2.rectangle(mask, (ix, iy), (x, y), 0, -1)
-
-    elif event == cv2.EVENT_LBUTTONUP:
-        drawing = False
-        cv2.rectangle(img, (ix, iy), (x, y), (0, 255, 0), -1)
-        cv2.rectangle(mask, (ix, iy), (x, y), 0, -1)
-
 
 # Now, `mask` contains the user-generated mask, and `img` shows where the user has drawn.
     
 if __name__ == "__main__":
     # Import the DeepImagePrior class and related functions from previous code
-    from deep_image_prior_28th import DeepImagePrior, inpaint_image, save_result
+    from deep_image_prior import DeepImagePrior, inpaint_image, save_result
     import os
     
     # Load an image
     img = cv2.imread('data/cow.png')
-    # mask = np.ones_like(img) * 255  # Create a mask initialized to white
 
-    # cv2.namedWindow('image')
-    # cv2.setMouseCallback('image', draw_rectangle)
+    import torch
 
-    # while(1):
-    #     cv2.imshow('image', img)
-    #     k = cv2.waitKey(1) & 0xFF
-    #     if k == 27:  # ESC key to stop
-    #         break
+    # Check if CUDA is available
+    print("CUDA available:", torch.cuda.is_available())
 
-    # cv2.destroyAllWindows()
+    # Check the active device
+    print("Current device:", torch.cuda.current_device())
 
-    # Save the edited image and the mask
-    # cv2.imwrite('edited_image.jpg', img)  # Save the image with user-drawn rectangles
-    # cv2.imwrite('mask.png', mask)  # Save the binary mask
-
-    # print("Images saved: 'edited_image.jpg' and 'mask.png'")
+    # Check the device name
+    print("Device name:", torch.cuda.get_device_name(torch.cuda.current_device()))
 
     image_path, selected_mask = object_detection_and_selection()
     
