@@ -103,12 +103,7 @@ def custom_loss(out, image, mask):
 def inpaint_image(image, mask, queue_results=None, num_iterations=300, learning_rate=0.01):
     """Perform inpainting using Deep Image Prior"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Resize image and mask to match model input size
-    # model_input_size = (256, 256)
-    # image = F.interpolate(image.unsqueeze(0), size=model_input_size, mode='bicubic', align_corners=True)
-    # mask = F.interpolate(mask.unsqueeze(0), size=model_input_size, mode='nearest')
-    
+        
     # Create model and optimizer
     net = DeepImagePrior().to(device)
     optimizer = optim.Adam(net.parameters(), lr=learning_rate)
